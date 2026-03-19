@@ -43,9 +43,10 @@ Two DataFrames (df_v1, df_v2) in "wide" format at a uniform 32 Hz, with columns:
 
   participant_id  str            e.g. "S01", "f07"
   timestamp       datetime64[ns] UTC time of each 32 Hz tick (from ACC grid)
-  phase           str            protocol phase label at that timestamp (pd.NA outside
-                                 any defined phase interval).  Repeated phase names
-                                 (Transition) are numbered: Transition_1, Transition_2, …
+  phase           str            protocol phase label. Pre-protocol, Post-protocol,
+                                 and trailing NaN rows (recording tail after the last
+                                 phase) are dropped.  Any unexpected mid-session NaN
+                                 rows emit a UserWarning and are also dropped.
   ACC_x           float          accelerometer x-axis   (1/64 g)
   ACC_y           float          accelerometer y-axis   (1/64 g)
   ACC_z           float          accelerometer z-axis   (1/64 g)
@@ -684,6 +685,78 @@ def _signals_to_wide(
 
 
 
+# ── Phase trimming ─────────────────────────────────────────────────────────
+
+# Phases that exist solely as recording bookends and carry no experimental
+# content — dropped after phase assignment.
+BOOKEND_PHASES = {"Pre-protocol", "Post-protocol"}
+
+
+def _trim_phases(df: pd.DataFrame, participant_id: str) -> pd.DataFrame:
+    """
+    Remove bookend and NaN phase rows from a per-participant wide DataFrame.
+
+    Three operations are applied in order:
+
+    1. Drop bookend phases ("Pre-protocol", "Post-protocol").
+       These are recording artefacts, not experimental conditions.
+
+    2. Identify the trailing NaN block — all rows after the last row whose
+       phase is not NaN.  This corresponds to the E4 continuing to record
+       after the final button press.  These rows are dropped silently.
+
+    3. Check whether any NaN-phase rows remain after step 2 (i.e. mid-session
+       gaps).  These are unexpected: a NaN in the middle of the protocol means
+       a timestamp fell outside every defined phase boundary, which could
+       indicate a missing tag or a phase-map alignment error.  A UserWarning
+       is emitted for each such participant, and those rows are also dropped.
+
+    Parameters
+    ----------
+    df             : per-participant wide DataFrame with a 'phase' column
+    participant_id : used in warning messages
+
+    Returns
+    -------
+    pd.DataFrame with bookend and NaN rows removed, index reset.
+    """
+    # ── 1. Drop bookend phases ───────────────────────────────────────────────
+    df = df[~df["phase"].isin(BOOKEND_PHASES)].copy()
+
+    # ── 2. Drop trailing NaN tail ────────────────────────────────────────────
+    # Find the integer position of the last non-NaN phase row.
+    valid_mask   = df["phase"].notna()
+    if not valid_mask.any():
+        # Entire DataFrame has no valid phase — nothing to keep
+        warnings.warn(
+            f"{participant_id}: no valid phase rows remain after dropping "
+            "bookend phases. Returning empty DataFrame."
+        )
+        return pd.DataFrame(columns=df.columns)
+
+    last_valid_pos = valid_mask.values.nonzero()[0][-1]   # last True index
+    # Rows strictly after the last valid phase are the trailing NaN tail
+    trailing_nan_count = len(df) - (last_valid_pos + 1)
+    df = df.iloc[: last_valid_pos + 1].copy()
+
+    # ── 3. Warn about any remaining mid-session NaN rows ─────────────────────
+    mid_nan_mask  = df["phase"].isna()
+    mid_nan_count = mid_nan_mask.sum()
+    if mid_nan_count > 0:
+        # Find which timestamps are affected, to help with debugging
+        mid_nan_ts = df.loc[mid_nan_mask, "timestamp"]
+        warnings.warn(
+            f"{participant_id}: {mid_nan_count} unexpected mid-session NaN-phase "
+            f"rows found (not part of the trailing tail). "
+            f"First occurrence: {mid_nan_ts.iloc[0]}. "
+            "This may indicate a missing tag or a phase-map misalignment. "
+            "These rows are dropped."
+        )
+        df = df[~mid_nan_mask].copy()
+
+    return df.reset_index(drop=True)
+
+
 def process_participant(
     folder_path: str,
     participant_id: str,
@@ -730,7 +803,8 @@ def process_participant(
     wide_df.insert(0, "participant_id", participant_id)
     wide_df.insert(2, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
-    return wide_df.reset_index(drop=True)
+    # ── Drop trailing tail, bookend phases, and warn on mid-session NaN ──────
+    return _trim_phases(wide_df, participant_id)
 
 
 def process_f14() -> pd.DataFrame:
@@ -764,7 +838,8 @@ def process_f14() -> pd.DataFrame:
     wide_df.insert(0, "participant_id", "f14")
     wide_df.insert(2, "phase",          assign_phases(wide_df["timestamp"], boundaries))
 
-    return wide_df.reset_index(drop=True)
+    # ── Drop trailing tail, bookend phases, and warn on mid-session NaN ──────
+    return _trim_phases(wide_df, "f14")
 
 
 
